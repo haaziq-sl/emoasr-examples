@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EmoKittenASR Realtime</title>
+  <link rel="icon" href="data:,">
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      color: #172026;
+      background: #f5f8f7;
+      font: 16px/1.5 system-ui, sans-serif;
+    }
+    main { width: min(680px, 100%); }
+    h1 { margin: 0 0 8px; font-size: 36px; letter-spacing: 0; }
+    p { color: #5a6764; }
+    button {
+      min-width: 112px;
+      min-height: 44px;
+      margin: 12px 8px 16px 0;
+      border: 1px solid #087f73;
+      border-radius: 6px;
+      padding: 0 16px;
+      color: white;
+      background: #087f73;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { border-color: #a2adaa; background: #a2adaa; cursor: default; }
+    h2 { margin: 20px 0 6px; font-size: 18px; }
+    .transcript {
+      min-height: 220px;
+      margin: 0;
+      padding: 18px;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+      border: 1px solid #d2dcda;
+      border-radius: 6px;
+      background: white;
+      font-size: 22px;
+    }
+    #clean { min-height: 120px; font-size: 18px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Realtime transcription</h1>
+    <p id="status">Ready.</p>
+    <button id="start">Start mic</button>
+    <button id="stop" disabled>Stop</button>
+    <h2>Enriched transcript</h2>
+    <pre id="enriched" class="transcript" aria-live="polite">Press Start mic and begin speaking.</pre>
+    <h2>Clean transcript</h2>
+    <pre id="clean" class="transcript" aria-live="polite">Clean text appears here.</pre>
+  </main>
+
+  <script type="module">
+    import OpenAI from "https://esm.sh/openai@6.46.0";
+    import { OpenAIRealtimeWebSocket } from "https://esm.sh/openai@6.46.0/realtime/websocket";
+
+    const MODEL = "emokittenasr-realtime";
+    const RATE = 24000;
+    const startButton = document.querySelector("#start");
+    const stopButton = document.querySelector("#stop");
+    const status = document.querySelector("#status");
+    const enriched = document.querySelector("#enriched");
+    const clean = document.querySelector("#clean");
+    let realtime, context, stream, source, capture, pending = [];
+
+    const releaseMicrophone = () => {
+      stream?.getTracks().forEach(track => track.stop());
+      capture?.disconnect();
+      source?.disconnect();
+      context?.close();
+    };
+
+    const append = samples => {
+      const pcm = Int16Array.from(samples, value =>
+        Math.max(-1, Math.min(1, value)) * (value < 0 ? 32768 : 32767)
+      );
+      const audio = btoa(String.fromCharCode(...new Uint8Array(pcm.buffer)));
+      realtime.send({ type: "input_audio_buffer.append", audio });
+    };
+
+    const resetButtons = () => {
+      startButton.disabled = false;
+      stopButton.disabled = true;
+    };
+
+    startButton.onclick = async () => {
+      try {
+        startButton.disabled = true;
+        status.textContent = "Requesting microphone access...";
+        enriched.textContent = "";
+        clean.textContent = "";
+        pending = [];
+
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        context = new AudioContext({ sampleRate: RATE });
+        await context.resume();
+        if (context.sampleRate !== RATE) throw new Error("This browser could not capture 24 kHz audio.");
+
+        const response = await fetch("/api/token", { method: "POST" });
+        if (!response.ok) throw new Error("Could not create a temporary API token.");
+        const token = await response.json();
+        const client = new OpenAI({
+          apiKey: token.value,
+          baseURL: "https://realtime.kittenmldemo.com/v1",
+          dangerouslyAllowBrowser: true,
+        });
+        realtime = new OpenAIRealtimeWebSocket({ model: MODEL }, client);
+
+        realtime.on("session.created", () => realtime.send({
+          type: "session.update",
+          session: {
+            type: "transcription",
+            audio: { input: {
+              format: { type: "audio/pcm", rate: RATE },
+              transcription: { model: MODEL },
+              turn_detection: null,
+            }},
+          },
+        }));
+
+        realtime.on("session.updated", () => {
+          const worklet = `
+            class PcmCapture extends AudioWorkletProcessor {
+              process(inputs) {
+                const channel = inputs[0]?.[0];
+                if (channel) this.port.postMessage(channel);
+                return true;
+              }
+            }
+            registerProcessor("pcm-capture", PcmCapture);
+          `;
+          const workletUrl = URL.createObjectURL(new Blob([worklet], { type: "text/javascript" }));
+          context.audioWorklet.addModule(workletUrl).then(() => {
+            URL.revokeObjectURL(workletUrl);
+            source = context.createMediaStreamSource(stream);
+            capture = new AudioWorkletNode(context, "pcm-capture");
+            capture.port.onmessage = event => {
+              pending.push(...event.data);
+              while (pending.length >= RATE) append(pending.splice(0, RATE));
+            };
+            source.connect(capture);
+            capture.connect(context.destination);
+            stopButton.disabled = false;
+            status.textContent = "Listening...";
+          }).catch(error => {
+            releaseMicrophone();
+            status.textContent = error.message || "Could not start audio capture.";
+            resetButtons();
+          });
+        });
+
+        realtime.on("conversation.item.input_audio_transcription.delta", event => {
+          enriched.textContent = event.text || event.delta || "";
+          clean.textContent = event.clean_text || event.delta || "";
+        });
+
+        realtime.on("conversation.item.input_audio_transcription.completed", event => {
+          enriched.textContent = event.text || event.transcript || "";
+          clean.textContent = event.clean_text || event.transcript || "";
+          status.textContent = "Finished.";
+          realtime.close();
+          resetButtons();
+        });
+
+        realtime.on("error", error => {
+          releaseMicrophone();
+          status.textContent = error.error?.message || error.message || "Connection failed.";
+          resetButtons();
+        });
+      } catch (error) {
+        releaseMicrophone();
+        status.textContent = error.message || String(error);
+        resetButtons();
+      }
+    };
+
+    stopButton.onclick = () => {
+      stopButton.disabled = true;
+      status.textContent = "Finishing...";
+      releaseMicrophone();
+      if (pending.length) append(pending.splice(0));
+      realtime.send({ type: "input_audio_buffer.commit" });
+    };
+  </script>
+</body>
+</html>
